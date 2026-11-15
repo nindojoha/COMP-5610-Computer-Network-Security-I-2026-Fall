@@ -27,3 +27,4 @@ __pycache__/
 *.sw?
 .env
 .nexus.sqlite3*
+.nexus-files/

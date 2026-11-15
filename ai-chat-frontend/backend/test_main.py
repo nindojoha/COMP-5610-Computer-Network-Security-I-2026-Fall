@@ -67,6 +67,14 @@ class ChatEndpointTests(unittest.TestCase):
         client_factory.assert_called_once_with(api_key="test-key")
         call = client.models.generate_content.call_args.kwargs
         self.assertEqual(call["model"], main.MODEL_NAME)
+        self.assertEqual(
+            call["config"].thinking_config.thinking_budget,
+            main.THINKING_BUDGET,
+        )
+        self.assertEqual(
+            call["config"].tool_config.function_calling_config.mode,
+            "AUTO",
+        )
         self.assertTrue(
             call["config"].system_instruction.startswith(main.CALENDAR_SYSTEM_INSTRUCTION)
         )
@@ -83,6 +91,23 @@ class ChatEndpointTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("calendar", str(call["contents"]).casefold())
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
+    @patch("backend.main.genai.Client")
+    def test_returns_plain_text_from_a_normal_model_candidate(self, client_factory: Mock) -> None:
+        client = client_factory.return_value
+        client.models.generate_content.return_value.candidates = [
+            SimpleNamespace(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text="Hello! How can I help?")],
+                )
+            )
+        ]
+
+        result = main.chat(main.ChatRequest(message="Hello"), user={"id": "test-user"})
+
+        self.assertEqual(result["reply"], "Hello! How can I help?")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_reports_missing_api_key(self) -> None:
@@ -177,6 +202,28 @@ class AccountAndCalendarEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_calendar_can_mark_an_event_done_and_undo_it(self) -> None:
+        self.register()
+        created = self.client.post(
+            "/api/calendar/events",
+            json=self.event("Submit checklist"),
+        ).json()["event"]
+
+        completed = self.client.patch(
+            f"/api/calendar/events/{created['id']}/completion",
+            json={"completed": True},
+        )
+        self.assertEqual(completed.status_code, 200)
+        self.assertTrue(completed.json()["event"]["completed"])
+        self.assertTrue(self.client.get("/api/calendar/events").json()["events"][0]["completed"])
+
+        reopened = self.client.patch(
+            f"/api/calendar/events/{created['id']}/completion",
+            json={"completed": False},
+        )
+        self.assertEqual(reopened.status_code, 200)
+        self.assertFalse(reopened.json()["event"]["completed"])
 
     def test_calendar_validates_duration_in_15_minute_increments(self) -> None:
         self.register()
@@ -356,6 +403,7 @@ class AccountAndCalendarEndpointTests(unittest.TestCase):
         self.assertEqual(client.models.generate_content.call_count, 2)
         follow_up = client.models.generate_content.call_args_list[1].kwargs["contents"]
         response_part = follow_up[-1].parts[0].function_response
+        self.assertEqual(follow_up[-1].role, "user")
         self.assertEqual(response_part.response["events"][0]["title"], "Network exam")
         self.assertNotIn("notes", response_part.response["events"][0])
         self.assertNotIn("Dentist", str(response_part.response))
@@ -420,12 +468,13 @@ class AccountAndCalendarEndpointTests(unittest.TestCase):
             "05:00",
         )
         self.assertEqual(result["pending_conflict"]["duration_minutes"], 15)
-        self.assertEqual(len(self.client.get("/api/calendar/events").json()["events"]), 1)
-        tool_follow_up = client.models.generate_content.call_args_list[1].kwargs["contents"][-1]
-        self.assertIn(
-            "Nothing has been changed",
-            str(tool_follow_up.parts[0].function_response.response),
+        self.assertEqual(
+            result["reply"],
+            "I found a calendar conflict. Nothing has been changed. "
+            "Review the event times and choose how to proceed below.",
         )
+        self.assertEqual(client.models.generate_content.call_count, 1)
+        self.assertEqual(len(self.client.get("/api/calendar/events").json()["events"]), 1)
 
         resolution = self.client.post(
             f"/api/calendar/proposals/{result['pending_conflict']['proposal_id']}/resolve",
@@ -456,6 +505,8 @@ class AccountAndCalendarEndpointTests(unittest.TestCase):
         self.assertIsNone(pending)
         self.assertEqual(result["status"], "created")
         self.assertGreater(result["occurrence_count"], 1)
+        self.assertEqual(result["event"]["date"], start.isoformat())
+        self.assertEqual(result["event"]["recurrence"]["frequency"], "weekly")
         events = storage.list_events(
             user["id"],
             start.isoformat(),
@@ -463,6 +514,115 @@ class AccountAndCalendarEndpointTests(unittest.TestCase):
         )
         self.assertEqual(len(events), 3)
         self.assertTrue(all(event["duration_minutes"] == 45 for event in events))
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
+    def test_chat_confirms_successful_schedule_without_second_model_call(self) -> None:
+        user = self.register()
+        event_date = (date.today() + timedelta(days=1)).isoformat()
+        create_call = types.FunctionCall(
+            name="create_calendar_event",
+            args={
+                "title": "Project meeting",
+                "date": event_date,
+                "time": "05:00",
+                "duration_minutes": 240,
+                "type": "appointment",
+            },
+        )
+        tool_response = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(function_call=create_call)],
+                    )
+                )
+            ],
+            text=None,
+        )
+        client = Mock()
+        client.models.generate_content.return_value = tool_response
+
+        with patch("backend.main.get_genai_client", return_value=client):
+            result = main.chat(
+                main.ChatRequest(message="Schedule a four-hour project meeting."),
+                user=user,
+            )
+
+        self.assertEqual(
+            result["reply"],
+            f'Scheduled "Project meeting" on {event_date} at 05:00 for 4 hours.',
+        )
+        self.assertIsNone(result["pending_conflict"])
+        client.models.generate_content.assert_called_once()
+        events = self.client.get("/api/calendar/events").json()["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["duration_minutes"], 240)
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
+    def test_chat_marks_lookup_result_done_without_looping(self) -> None:
+        user = self.register()
+        created = self.client.post(
+            "/api/calendar/events",
+            json=self.event("Tuesday meeting", "10:30", "2026-11-17"),
+        ).json()["event"]
+        lookup_call = types.FunctionCall(
+            name="lookup_calendar_events",
+            args={"query": "meeting", "date_from": "2026-11-17", "date_to": "2026-11-17"},
+        )
+        lookup_response = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(function_call=lookup_call)],
+                    )
+                )
+            ],
+            text=None,
+        )
+        mark_call = types.FunctionCall(
+            name="mark_calendar_event_done",
+            args={"event_id": created["id"], "completed": True},
+        )
+        mark_response = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(function_call=mark_call)],
+                    )
+                )
+            ],
+            text=None,
+        )
+        client = Mock()
+        client.models.generate_content.side_effect = [lookup_response, mark_response]
+
+        with patch("backend.main.get_genai_client", return_value=client):
+            result = main.chat(
+                main.ChatRequest(message="Check off the meeting on Tuesday as done."),
+                user=user,
+            )
+
+        self.assertEqual(
+            result["reply"],
+            'marked "Tuesday meeting" as done on 2026-11-17 at 10:30.',
+        )
+        self.assertEqual(client.models.generate_content.call_count, 2)
+        first_config = client.models.generate_content.call_args_list[0].kwargs["config"]
+        second_config = client.models.generate_content.call_args_list[1].kwargs["config"]
+        self.assertEqual(
+            first_config.tool_config.function_calling_config.allowed_function_names,
+            ["lookup_calendar_events"],
+        )
+        self.assertEqual(
+            second_config.tool_config.function_calling_config.allowed_function_names,
+            ["mark_calendar_event_done"],
+        )
+        self.assertTrue(
+            self.client.get("/api/calendar/events").json()["events"][0]["completed"]
+        )
 
     @patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
     def test_chat_cannot_remove_an_event_without_a_lookup_result(self) -> None:

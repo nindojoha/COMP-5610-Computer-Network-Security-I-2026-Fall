@@ -59,6 +59,42 @@ class StorageTests(unittest.TestCase):
         self.assertIsNone(storage.get_event(self.other["id"], event_id))
         self.assertFalse(storage.delete_event(self.other["id"], event_id))
 
+    def test_document_vectors_are_searchable_and_isolated_by_user(self) -> None:
+        document = storage.create_document(
+            self.owner["id"],
+            "notes.txt",
+            "stored.txt",
+            "text/plain",
+            20,
+            "hash",
+            [
+                ("network security concepts", [1.0, 0.0]),
+                ("calendar planning", [0.0, 1.0]),
+            ],
+        )
+
+        matches = storage.search_document_chunks(self.owner["id"], [1.0, 0.0])
+        self.assertEqual(matches[0]["document_id"], document["id"])
+        self.assertIn("network security", matches[0]["content"])
+        self.assertEqual(storage.search_document_chunks(self.other["id"], [1.0, 0.0]), [])
+
+    def test_document_listing_and_delete_are_user_scoped(self) -> None:
+        document = storage.create_document(
+            self.owner["id"],
+            "syllabus.txt",
+            "stored.txt",
+            "text/plain",
+            12,
+            "hash",
+            [("course schedule", [1.0])],
+        )
+
+        self.assertEqual(storage.list_documents(self.owner["id"])[0]["name"], "syllabus.txt")
+        self.assertEqual(storage.list_documents(self.other["id"]), [])
+        self.assertIsNone(storage.delete_document(self.other["id"], document["id"]))
+        self.assertIsNotNone(storage.delete_document(self.owner["id"], document["id"]))
+        self.assertEqual(storage.list_documents(self.owner["id"]), [])
+
     def test_adjacent_quarter_hour_slots_do_not_conflict(self) -> None:
         storage.create_or_propose_event(self.owner["id"], self.event("First", "10:00"))
 

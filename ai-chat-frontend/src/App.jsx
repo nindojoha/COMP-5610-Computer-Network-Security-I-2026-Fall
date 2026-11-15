@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import CalendarView from './Calendar.jsx'
 import Auth from './Auth.jsx'
 import CurrentDateTime from './CurrentDateTime.jsx'
@@ -10,7 +10,7 @@ const tools = [
   { name: 'Explore', icon: 'search' },
   { name: 'Calendar', icon: 'calendar' },
   { name: 'Code assistant', icon: 'code' },
-  { name: 'Projects', icon: 'folder' },
+  { name: 'Files', icon: 'folder' },
   { name: 'Saved chats', icon: 'bookmark' },
 ]
 
@@ -116,6 +116,11 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const [resolvingProposal, setResolvingProposal] = useState(null)
+  const [files, setFiles] = useState([])
+  const [fileSearch, setFileSearch] = useState('')
+  const [isUploading, setIsUploading] = useState(false)
+  const [fileError, setFileError] = useState('')
+  const fileInputRef = useRef(null)
 
   useEffect(() => {
     let active = true
@@ -149,6 +154,59 @@ function App() {
   }, [])
 
   const completedTasks = tasks.filter((task) => task.completed).length
+
+  useEffect(() => {
+    if (activeTool !== 'Files') return
+    let active = true
+    const query = fileSearch.trim()
+    const timer = setTimeout(() => fetch(`/api/files${query ? `?query=${encodeURIComponent(query)}` : ''}`)
+      .then(async (response) => {
+        const result = await response.json()
+        if (!active) return
+        if (!response.ok) throw new Error(result.detail || 'Unable to load files.')
+        setFiles(result.files || [])
+        setFileError('')
+      })
+      .catch((error) => {
+        if (active) setFileError(error instanceof Error ? error.message : 'Unable to load files.')
+      }), 300)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [activeTool, fileSearch])
+
+  async function uploadFile(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    setIsUploading(true)
+    setFileError('')
+    try {
+      const body = new FormData()
+      body.append('file', file)
+      const response = await fetch('/api/files', { method: 'POST', body })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || 'Unable to upload file.')
+      setFiles((currentFiles) => [result.file, ...currentFiles])
+      setActiveTool('Files')
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : 'Unable to upload file.')
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
+  async function removeFile(fileId) {
+    try {
+      const response = await fetch(`/api/files/${fileId}`, { method: 'DELETE' })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || 'Unable to delete file.')
+      setFiles((currentFiles) => currentFiles.filter((file) => file.id !== fileId))
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : 'Unable to delete file.')
+    }
+  }
 
   function toggleTask(taskId) {
     setTasks((currentTasks) =>
@@ -402,6 +460,14 @@ function App() {
         <main className="calendar-panel">
           <CalendarView onUnauthorized={handleUnauthorized} />
         </main>
+      ) : activeTool === 'Files' ? (
+        <FilesPanel
+          error={fileError}
+          files={files}
+          onDelete={removeFile}
+          onSearch={setFileSearch}
+          search={fileSearch}
+        />
       ) : (
       <main className="chat-panel">
         <header className="topbar">
@@ -448,6 +514,13 @@ function App() {
 
           <div className="composer-wrap">
             <form className="composer" onSubmit={submitPrompt}>
+              <input
+                accept=".pdf,.txt,application/pdf,text/plain"
+                className="file-input"
+                onChange={uploadFile}
+                ref={fileInputRef}
+                type="file"
+              />
               <textarea
                 aria-label="Message Nexus"
                 onChange={(event) => setPrompt(event.target.value)}
@@ -462,7 +535,20 @@ function App() {
                 value={prompt}
               />
               <div className="composer-actions">
-                <span className="composer-hint">Shift + Enter for a new line</span>
+                <div className="composer-leading-actions">
+                  <button
+                    aria-label="Upload a file"
+                    className="attach-button"
+                    disabled={isUploading}
+                    onClick={() => fileInputRef.current?.click()}
+                    type="button"
+                  >
+                    <Icon name="plus" size={18} />
+                  </button>
+                  <span className="composer-hint">
+                    {isUploading ? 'Embedding file...' : 'Shift + Enter for a new line'}
+                  </span>
+                </div>
                 <button
                   className="send-button"
                   type="submit"
@@ -576,6 +662,66 @@ function ConflictActions({ disabled, onResolve, proposal }) {
         </button>
       </div>
     </div>
+  )
+}
+
+function FilesPanel({ error, files, onDelete, onSearch, search }) {
+  return (
+    <main className="files-panel">
+      <header className="files-header">
+        <div>
+          <span className="eyebrow">YOUR WORKSPACE</span>
+          <h1>Files</h1>
+          <p>Search your uploaded study material by meaning.</p>
+        </div>
+        <Icon name="folder" size={30} />
+      </header>
+      <label className="file-search">
+        <Icon name="search" size={17} />
+        <input
+          aria-label="Search files semantically"
+          onChange={(event) => onSearch(event.target.value)}
+          placeholder="Search files semantically..."
+          type="search"
+          value={search}
+        />
+      </label>
+      {error && <p className="file-error" role="alert">{error}</p>}
+      <section className="file-list" aria-live="polite">
+        {files.length === 0 ? (
+          <p className="empty-files">
+            {search ? 'No matching file excerpts found.' : 'Uploaded files will appear here.'}
+          </p>
+        ) : (
+          files.map((file) => (
+            <article className="file-card" key={`${file.id}-${file.chunk_index || 'document'}`}>
+              <div className="file-card-icon"><Icon name="folder" size={18} /></div>
+              <div className="file-card-body">
+                <strong>{file.name}</strong>
+                {file.content ? (
+                  <p>{file.content.slice(0, 240)}{file.content.length > 240 ? '…' : ''}</p>
+                ) : (
+                  <p>{new Date(file.created_at).toLocaleString()}</p>
+                )}
+                {file.score !== undefined && (
+                  <span className="file-score">Semantic match · {Math.round(file.score * 100)}%</span>
+                )}
+              </div>
+              {!file.content && (
+                <button
+                  aria-label={`Delete ${file.name}`}
+                  className="file-delete"
+                  onClick={() => onDelete(file.id)}
+                  type="button"
+                >
+                  Delete
+                </button>
+              )}
+            </article>
+          ))
+        )}
+      </section>
+    </main>
   )
 }
 

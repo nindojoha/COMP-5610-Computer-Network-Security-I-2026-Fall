@@ -23,12 +23,15 @@
    ```
 
 The Vite development server proxies `/api` requests to the Python backend at `http://127.0.0.1:8000`. The chat endpoint is `POST /api/chat`; it accepts a message and the current conversation history and returns the Gemini response. The backend uses the `gemini-2.5-flash` model.
+Chat requests use a 1,024-token Gemini thinking budget. Calendar completion requests explicitly force a lookup tool call followed by the completion tool; successful event creation, completion, and scheduling conflicts return deterministic confirmations without an unnecessary final model call. Other event lookups still use a follow-up call to formulate an answer.
 
 On first use, create a Nexus account from the sign-in screen. Passwords are stored as scrypt hashes, sessions use HTTP-only cookies, and each account's calendar events are isolated in the backend SQLite database (`.nexus.sqlite3` by default). Set `NEXUS_DATABASE_PATH` to choose another database location. When serving over HTTPS, set `NEXUS_COOKIE_SECURE=true`.
 
 The chat composer shows the browser's local date and time with its timezone. Each chat request includes that offset-aware timestamp as system context so Gemini can resolve relative dates such as "tomorrow" against the user's clock.
 
-Calendar events must start on 15-minute boundaries and can last from 15 minutes up to 24 hours in 15-minute increments. Events can repeat daily, weekly on selected weekdays, monthly, or yearly; the calendar generates recurring occurrences one year ahead and extends the series as later dates are viewed. When editing or deleting a recurring event, choose this occurrence, this and following, or the entire series.
+Use the plus button beside the chat composer to upload PDF or UTF-8 TXT study files. Files are stored under the configured `NEXUS_FILES_PATH` in a separate subfolder per account. Extracted text is split into chunks and embedded with `EMBEDDING_MODEL` (default `text-embedding-004`); the vectors are stored in the account-scoped SQLite database for semantic file search. The Files folder in the left navbar lists uploads by date and searches their relevant excerpts. Document-related chat prompts, including quiz and review requests, retrieve only the closest file excerpts for Gemini. Set `NEXUS_FILES_PATH` outside the repository when desired, and do not commit the files directory or database.
+
+Calendar events must start on 15-minute boundaries and can last from 15 minutes up to 24 hours in 15-minute increments. Events can repeat daily, weekly on selected weekdays, monthly, or yearly; the calendar generates recurring occurrences one year ahead and extends the series as later dates are viewed. Individual event occurrences can be marked done and reopened as checklist items, including recurring occurrences. Gemini can also mark an event done after looking up its exact event id. When editing or deleting a recurring event, choose this occurrence, this and following, or the entire series.
 
 If a new event or recurring series conflicts with existing events, choose whether to override them, allow the overlaps, or reject the change. For a series, one choice applies to every conflict in the proposal. Gemini can schedule event durations and recurrence through its calendar tool, but does not receive the calendar on every chat request; event data is returned only for a specific lookup or scheduling operation, and lookups are limited to related events.
 
@@ -40,3 +43,5 @@ python -m unittest backend.test_main backend.test_storage
 
 Notes
 11/14/2026: Cannot specify day to schedule events on calendar and needed exact date to schedule events. That has been fixed but model now overrides its events without asking how to resolve conflicts.
+
+11/15/2026: Offset by one day during calendar scheduling.

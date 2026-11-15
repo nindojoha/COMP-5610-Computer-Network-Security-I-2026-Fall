@@ -213,6 +213,31 @@ function CalendarView({ onUnauthorized }) {
     }
   }
 
+  async function setEventCompleted(eventId, completed) {
+    setActionError('')
+    try {
+      const response = await fetch(`/api/calendar/events/${eventId}/completion`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ completed }),
+      })
+      const result = await response.json()
+      if (response.status === 401) {
+        onUnauthorized(result.detail || 'Your session expired. Please sign in again.')
+        return
+      }
+      if (!response.ok) {
+        throw new Error(result.detail || 'Unable to update event status.')
+      }
+      if (draft?.id === eventId) {
+        setDraft((current) => ({ ...current, completed: result.event.completed }))
+      }
+      await reloadEvents()
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Unable to update event status.')
+    }
+  }
+
   async function resolveEventConflict(resolution) {
     if (!pendingConflict) return
     setResolvingConflict(true)
@@ -368,7 +393,7 @@ function CalendarView({ onUnauthorized }) {
           {agendaEvents.length ? (
             agendaEvents.map((event) => (
               <button
-                className={`agenda-event ${event.type}`}
+                className={`agenda-event ${event.type} ${event.completed ? 'completed' : ''}`}
                 key={event.id}
                 onClick={() => openEvent(event)}
                 type="button"
@@ -445,7 +470,7 @@ function CalendarView({ onUnauthorized }) {
                   <div className="calendar-day-events">
                     {dayEvents.slice(0, view === 'week' ? 8 : 3).map((event) => (
                       <button
-                        className={`calendar-event ${event.type}`}
+                        className={`calendar-event ${event.type} ${event.completed ? 'completed' : ''}`}
                         key={event.id}
                         onClick={() => openEvent(event)}
                         title={`${event.time ? `${formatEventTime(event)} · ` : ''}${event.title}${event.recurrence ? ` · Repeats ${event.recurrence.frequency}` : ''}`}
@@ -659,6 +684,16 @@ function CalendarView({ onUnauthorized }) {
                   <option value="reminder">Reminder</option>
                 </select>
               </label>
+              {editingId && (
+                <label className="event-completion">
+                  <input
+                    checked={Boolean(draft.completed)}
+                    onChange={(event) => setEventCompleted(editingId, event.target.checked)}
+                    type="checkbox"
+                  />
+                  Mark this event as done
+                </label>
+              )}
               <label>
                 Notes <span className="optional-label">Optional</span>
                 <textarea

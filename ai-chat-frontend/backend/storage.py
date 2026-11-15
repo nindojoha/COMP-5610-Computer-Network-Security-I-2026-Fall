@@ -31,6 +31,23 @@ def _database_path() -> Path:
     return Path(os.getenv("NEXUS_DATABASE_PATH", str(DEFAULT_DATABASE_PATH)))
 
 
+def _files_root() -> Path:
+    return Path(
+        os.getenv(
+            "NEXUS_FILES_PATH",
+            str(DEFAULT_DATABASE_PATH.parent / ".nexus-files"),
+        )
+    )
+
+
+def user_files_directory(user_id: str) -> Path:
+    """Return the private on-disk directory for one authenticated user."""
+
+    directory = _files_root() / user_id
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
     path = _database_path()
@@ -97,6 +114,7 @@ def _initialize_schema(database: sqlite3.Connection) -> None:
             notes TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             duration_minutes INTEGER NOT NULL DEFAULT 15,
+            completed INTEGER NOT NULL DEFAULT 0,
             series_id TEXT REFERENCES event_series(id) ON DELETE CASCADE,
             occurrence_date TEXT,
             is_exception INTEGER NOT NULL DEFAULT 0
@@ -116,6 +134,31 @@ def _initialize_schema(database: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS pending_actions_user_idx
             ON pending_calendar_actions(user_id, status, expires_at);
+
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            original_filename TEXT NOT NULL,
+            stored_filename TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS documents_user_created_idx
+            ON documents(user_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS document_chunks_user_idx
+            ON document_chunks(user_id, document_id);
         """
     )
     event_columns = {
@@ -136,6 +179,10 @@ def _initialize_schema(database: sqlite3.Connection) -> None:
         database.execute(
             "ALTER TABLE events ADD COLUMN is_exception INTEGER NOT NULL DEFAULT 0"
         )
+    if "completed" not in event_columns:
+        database.execute(
+            "ALTER TABLE events ADD COLUMN completed INTEGER NOT NULL DEFAULT 0"
+        )
     database.execute(
         "CREATE INDEX IF NOT EXISTS events_series_idx ON events(series_id, occurrence_date)"
     )
@@ -143,6 +190,153 @@ def _initialize_schema(database: sqlite3.Connection) -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS events_series_occurrence_idx
            ON events(series_id, occurrence_date) WHERE series_id IS NOT NULL"""
     )
+
+
+def create_document(
+    user_id: str,
+    original_filename: str,
+    stored_filename: str,
+    content_type: str,
+    size_bytes: int,
+    sha256: str,
+    chunks: list[tuple[str, list[float]]],
+) -> dict[str, object]:
+    document_id = str(uuid.uuid4())
+    created_at = _now().isoformat()
+    with connection() as database:
+        database.execute(
+            """INSERT INTO documents
+               (id, user_id, original_filename, stored_filename, content_type,
+                size_bytes, sha256, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                document_id,
+                user_id,
+                original_filename,
+                stored_filename,
+                content_type,
+                size_bytes,
+                sha256,
+                created_at,
+            ),
+        )
+        database.executemany(
+            """INSERT INTO document_chunks
+               (id, document_id, user_id, chunk_index, content, embedding, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    str(uuid.uuid4()),
+                    document_id,
+                    user_id,
+                    index,
+                    content,
+                    json.dumps(embedding),
+                    created_at,
+                )
+                for index, (content, embedding) in enumerate(chunks)
+            ],
+        )
+    return {
+        "id": document_id,
+        "user_id": user_id,
+        "name": original_filename,
+        "content_type": content_type,
+        "size_bytes": size_bytes,
+        "created_at": created_at,
+    }
+
+
+def list_documents(user_id: str) -> list[dict[str, object]]:
+    with connection() as database:
+        rows = database.execute(
+            """SELECT d.id, d.original_filename, d.content_type, d.size_bytes,
+                      d.created_at, COUNT(c.id) AS chunk_count
+               FROM documents d
+               LEFT JOIN document_chunks c ON c.document_id = d.id
+               WHERE d.user_id = ?
+               GROUP BY d.id
+               ORDER BY d.created_at DESC""",
+            (user_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "name": row["original_filename"],
+            "content_type": row["content_type"],
+            "size_bytes": row["size_bytes"],
+            "created_at": row["created_at"],
+            "chunk_count": row["chunk_count"],
+        }
+        for row in rows
+    ]
+
+
+def document_exists(user_id: str) -> bool:
+    with connection() as database:
+        row = database.execute(
+            "SELECT 1 FROM documents WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def search_document_chunks(
+    user_id: str,
+    query_embedding: list[float],
+    top_k: int = 5,
+) -> list[dict[str, object]]:
+    with connection() as database:
+        rows = database.execute(
+            """SELECT c.id, c.document_id, c.content, c.embedding,
+                      d.original_filename
+               FROM document_chunks c
+               JOIN documents d ON d.id = c.document_id
+               WHERE c.user_id = ?""",
+            (user_id,),
+        ).fetchall()
+
+    def cosine(left: list[float], right: list[float]) -> float:
+        if not left or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = sum(value * value for value in left) ** 0.5
+        right_norm = sum(value * value for value in right) ** 0.5
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    matches = [
+        {
+            "id": row["id"],
+            "document_id": row["document_id"],
+            "name": row["original_filename"],
+            "content": row["content"],
+            "score": cosine(query_embedding, json.loads(row["embedding"])),
+        }
+        for row in rows
+    ]
+    matches.sort(key=lambda item: item["score"], reverse=True)
+    return matches[:top_k]
+
+
+def delete_document(user_id: str, document_id: str) -> dict[str, object] | None:
+    with connection() as database:
+        row = database.execute(
+            """SELECT original_filename, stored_filename
+               FROM documents WHERE id = ? AND user_id = ?""",
+            (document_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        database.execute(
+            "DELETE FROM documents WHERE id = ? AND user_id = ?",
+            (document_id, user_id),
+        )
+    path = user_files_directory(user_id) / row["stored_filename"]
+    if path.exists():
+        path.unlink()
+    return {"id": document_id, "name": row["original_filename"]}
 
 
 def hash_password(password: str) -> str:
@@ -249,6 +443,7 @@ def _event_from_row(row: sqlite3.Row) -> dict[str, object]:
             "type",
             "notes",
             "duration_minutes",
+            "completed",
             "series_id",
             "occurrence_date",
             "series_start_date",
@@ -354,7 +549,7 @@ def _select_events(
         values.append(date_to)
     rows = database.execute(
         f"""SELECT e.id, e.title, e.date, e.time, e.type, e.notes,
-                   e.duration_minutes, e.series_id, e.occurrence_date,
+                   e.duration_minutes, e.completed, e.series_id, e.occurrence_date,
                    s.start_date AS series_start_date,
                    s.frequency, s.recurrence_interval, s.weekdays
             FROM events e LEFT JOIN event_series s ON s.id = e.series_id
@@ -379,7 +574,7 @@ def get_event(user_id: str, event_id: str) -> dict[str, object] | None:
     with connection() as database:
         row = database.execute(
             """SELECT e.id, e.title, e.date, e.time, e.type, e.notes,
-                      e.duration_minutes, e.series_id, e.occurrence_date,
+                      e.duration_minutes, e.completed, e.series_id, e.occurrence_date,
                       s.start_date AS series_start_date,
                       s.frequency, s.recurrence_interval, s.weekdays
                FROM events e LEFT JOIN event_series s ON s.id = e.series_id
@@ -436,6 +631,28 @@ def delete_event(user_id: str, event_id: str, scope: str = "this_occurrence") ->
     return True
 
 
+def set_event_completed(
+    user_id: str,
+    event_id: str,
+    completed: bool,
+) -> dict[str, object] | None:
+    with connection() as database:
+        database.execute(
+            "UPDATE events SET completed = ? WHERE user_id = ? AND id = ?",
+            (int(completed), user_id, event_id),
+        )
+        row = database.execute(
+            """SELECT e.id, e.title, e.date, e.time, e.type, e.notes,
+                      e.duration_minutes, e.completed, e.series_id, e.occurrence_date,
+                      s.start_date AS series_start_date,
+                      s.frequency, s.recurrence_interval, s.weekdays
+               FROM events e LEFT JOIN event_series s ON s.id = e.series_id
+               WHERE e.user_id = ? AND e.id = ?""",
+            (user_id, event_id),
+        ).fetchone()
+    return _event_from_row(row) if row else None
+
+
 def _event_start(event: dict[str, object]) -> datetime:
     return datetime.combine(
         date.fromisoformat(str(event["date"])),
@@ -459,6 +676,7 @@ def _event_fields(event: dict[str, object]) -> dict[str, object]:
         "type": event["type"],
         "notes": event.get("notes", ""),
         "duration_minutes": event.get("duration_minutes", EVENT_DURATION_MINUTES),
+        "completed": int(bool(event.get("completed", False))),
     }
 
 
@@ -483,13 +701,14 @@ def _insert_event(
     database.execute(
         """INSERT INTO events
            (id, user_id, title, date, time, type, notes, created_at,
-            duration_minutes, series_id, occurrence_date, is_exception)
+            duration_minutes, completed, series_id, occurrence_date, is_exception)
            VALUES (:id, :user_id, :title, :date, :time, :type, :notes, :created_at,
-                   :duration_minutes, :series_id, :occurrence_date, :is_exception)""",
+                   :duration_minutes, :completed, :series_id, :occurrence_date,
+                   :is_exception)""",
         saved,
     )
     return {key: saved[key] for key in (
-        "id", "title", "date", "time", "type", "notes", "duration_minutes",
+        "id", "title", "date", "time", "type", "notes", "duration_minutes", "completed",
         "series_id", "occurrence_date",
     )}
 

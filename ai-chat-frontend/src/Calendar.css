@@ -309,6 +309,22 @@
   font-weight: 650;
 }
 
+.calendar-event.completed,
+.agenda-event.completed {
+  opacity: 0.62;
+  background: #eeedf2;
+  border-color: #aaa6b5;
+}
+
+.calendar-event.completed {
+  text-decoration: line-through;
+}
+
+.calendar-event.completed span,
+.agenda-event.completed .agenda-event-copy strong {
+  text-decoration: line-through;
+}
+
 .calendar-event.appointment {
   border-color: #cfc2eb;
   color: #6e55a6;
@@ -405,6 +421,19 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.event-completion {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.event-completion input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
 }
 
 .calendar-empty {
