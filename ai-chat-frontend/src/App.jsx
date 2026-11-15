@@ -1,9 +1,14 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import CalendarView from './Calendar.jsx'
+import Auth from './Auth.jsx'
+import CurrentDateTime from './CurrentDateTime.jsx'
+import { toLocalDateTime } from './localDateTime.js'
 import './App.css'
 
 const tools = [
   { name: 'New chat', icon: 'plus' },
   { name: 'Explore', icon: 'search' },
+  { name: 'Calendar', icon: 'calendar' },
   { name: 'Code assistant', icon: 'code' },
   { name: 'Projects', icon: 'folder' },
   { name: 'Saved chats', icon: 'bookmark' },
@@ -20,6 +25,12 @@ const initialTasks = [
 const iconPaths = {
   bookmark: (
     <path d="M6 4.75h12a1 1 0 0 1 1 1V21l-7-4-7 4V5.75a1 1 0 0 1 1-1Z" />
+  ),
+  calendar: (
+    <>
+      <rect x="3.5" y="5" width="17" height="16" rx="2" />
+      <path d="M16 3v4M8 3v4M3.5 10h17" />
+    </>
   ),
   check: <path d="m5 12 4 4L19 6" />,
   code: (
@@ -85,13 +96,57 @@ function Icon({ name, size = 20 }) {
   )
 }
 
+function formatEventTimeRange(event) {
+  const [hour, minute] = event.time.split(':').map(Number)
+  const endTotal = hour * 60 + minute + (event.duration_minutes || 15)
+  const endMinutes = endTotal % (24 * 60)
+  const dayOffset = Math.floor(endTotal / (24 * 60))
+  const endTime = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`
+  return `${event.time}–${endTime}${dayOffset ? ` (+${dayOffset}d)` : ''}`
+}
+
 function App() {
+  const [authStatus, setAuthStatus] = useState('loading')
+  const [authError, setAuthError] = useState('')
+  const [user, setUser] = useState(null)
   const [activeTool, setActiveTool] = useState('New chat')
   const [tasks, setTasks] = useState(initialTasks)
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isSending, setIsSending] = useState(false)
+  const [resolvingProposal, setResolvingProposal] = useState(null)
+
+  useEffect(() => {
+    let active = true
+    fetch('/api/auth/me')
+      .then(async (response) => {
+        const result = await response.json()
+        if (!active) return
+        if (response.ok) {
+          setUser(result.user)
+          setAuthStatus('signed-in')
+        } else if (response.status === 401) {
+          setAuthStatus('signed-out')
+        } else {
+          throw new Error(result.detail || 'Unable to verify your session.')
+        }
+      })
+      .catch((error) => {
+        if (!active) return
+        setAuthError(
+          error instanceof TypeError
+            ? 'Unable to reach the server. Check that the backend is running and try again.'
+            : error instanceof Error
+            ? error.message
+            : 'Unable to verify your session.',
+        )
+        setAuthStatus('signed-out')
+      })
+    return () => {
+      active = false
+    }
+  }, [])
 
   const completedTasks = tasks.filter((task) => task.completed).length
 
@@ -101,6 +156,122 @@ function App() {
         task.id === taskId ? { ...task, completed: !task.completed } : task,
       ),
     )
+  }
+
+  function handleAuthenticated(authenticatedUser) {
+    setUser(authenticatedUser)
+    setAuthError('')
+    setMessages([])
+    setPrompt('')
+    setActiveTool('New chat')
+    setResolvingProposal(null)
+    setAuthStatus('signed-in')
+  }
+
+  const handleUnauthorized = useCallback((message) => {
+    setAuthError(message)
+    setAuthStatus('signed-out')
+    setMessages([])
+    setPrompt('')
+    setActiveTool('New chat')
+    setResolvingProposal(null)
+  }, [])
+
+  async function signOut() {
+    try {
+      const response = await fetch('/api/auth/logout', { method: 'POST' })
+      if (response.status === 401) {
+        setMessages([])
+        setUser(null)
+        setPrompt('')
+        setActiveTool('New chat')
+        setResolvingProposal(null)
+        setAuthStatus('signed-out')
+        setAuthError('Your session expired. Please sign in again.')
+        return
+      }
+      if (!response.ok) {
+        const result = await response.json()
+        throw new Error(result.detail || 'Unable to sign out.')
+      }
+      setMessages([])
+      setUser(null)
+      setPrompt('')
+      setActiveTool('New chat')
+      setResolvingProposal(null)
+      setAuthStatus('signed-out')
+      setAuthError('')
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to sign out.')
+    }
+  }
+
+  async function resolveChatConflict(proposal, resolution) {
+    setResolvingProposal(proposal.proposal_id)
+    try {
+      const response = await fetch(
+        `/api/calendar/proposals/${proposal.proposal_id}/resolve`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution }),
+        },
+      )
+      const result = await response.json()
+      if (response.status === 401) {
+        handleUnauthorized(result.detail || 'Your session expired. Please sign in again.')
+        return
+      }
+      if (!response.ok) {
+        if (response.status === 409 && result.detail?.status === 'conflict') {
+          const nextProposal = {
+            proposal_id: result.detail.proposal_id,
+            title: result.detail.event.title,
+            date: result.detail.event.date,
+            time: result.detail.event.time,
+            duration_minutes: result.detail.event.duration_minutes,
+            conflicts: result.detail.conflicts,
+            conflict_count: result.detail.conflict_count,
+            occurrence_count: result.detail.occurrence_count,
+          }
+          setMessages((currentMessages) =>
+            currentMessages.map((message) =>
+              message.pendingConflict?.proposal_id === proposal.proposal_id
+                ? { ...message, pendingConflict: nextProposal }
+                : message,
+            ),
+          )
+          return
+        }
+        throw new Error(result.detail || 'Unable to resolve this calendar conflict.')
+      }
+
+      setMessages((currentMessages) => [
+        ...currentMessages.map((message) =>
+          message.pendingConflict?.proposal_id === proposal.proposal_id
+            ? { ...message, pendingConflict: null }
+            : message,
+        ),
+        {
+          role: 'assistant',
+          content: resolution === 'reject'
+            ? 'Scheduling canceled. No calendar changes were made.'
+            : resolution === 'override'
+              ? `"${proposal.title}" was scheduled, replacing the conflicting event(s).`
+              : `"${proposal.title}" was scheduled alongside the existing event(s).`,
+        },
+      ])
+    } catch (error) {
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          role: 'error',
+          content: error instanceof Error ? error.message : 'Unable to resolve this conflict.',
+        },
+      ])
+    } finally {
+      setResolvingProposal(null)
+    }
   }
 
   async function submitPrompt(event) {
@@ -125,7 +296,11 @@ function App() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, history }),
+        body: JSON.stringify({
+          message,
+          history,
+          client_datetime: toLocalDateTime(new Date()),
+        }),
       })
       let result
       try {
@@ -135,6 +310,10 @@ function App() {
       }
 
       if (!response.ok) {
+        if (response.status === 401) {
+          setAuthStatus('signed-out')
+          setAuthError(result.detail || 'Your session expired. Please sign in again.')
+        }
         throw new Error(result.detail || 'The assistant could not complete your request.')
       }
       if (typeof result.reply !== 'string' || !result.reply.trim()) {
@@ -143,7 +322,13 @@ function App() {
 
       setMessages((currentMessages) => [
         ...currentMessages,
-        { role: 'assistant', content: result.reply },
+        {
+          role: 'assistant',
+          content: result.pending_conflict
+            ? 'I found a calendar conflict. Nothing has been changed. Review the event times and choose how to proceed below.'
+            : result.reply,
+          pendingConflict: result.pending_conflict,
+        },
       ])
     } catch (error) {
       setMessages((currentMessages) => [
@@ -163,6 +348,14 @@ function App() {
     }
   }
 
+  if (authStatus === 'loading') {
+    return <main className="auth-loading" aria-label="Loading account">Loading Nexus...</main>
+  }
+
+  if (authStatus !== 'signed-in') {
+    return <Auth onAuthenticated={handleAuthenticated} initialError={authError} />
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar left-sidebar" aria-label="Main navigation">
@@ -177,6 +370,7 @@ function App() {
           {tools.map((tool) => (
             <button
               className={`tool-link${activeTool === tool.name ? ' active' : ''}`}
+              aria-label={tool.name}
               key={tool.name}
               onClick={() => setActiveTool(tool.name)}
               type="button"
@@ -196,19 +390,25 @@ function App() {
             <Icon name="settings" />
             <span>Settings</span>
           </button>
-          <button className="profile-button" type="button" aria-label="User profile">
-            <span className="avatar">H</span>
-            <span className="profile-name">Huy Le</span>
+          <button className="profile-button" onClick={signOut} type="button" aria-label="Sign out">
+            <span className="avatar">{user.display_name.slice(0, 1).toUpperCase()}</span>
+            <span className="profile-name">{user.display_name}</span>
             <span className="profile-plan">Personal</span>
           </button>
         </div>
       </aside>
 
+      {activeTool === 'Calendar' ? (
+        <main className="calendar-panel">
+          <CalendarView onUnauthorized={handleUnauthorized} />
+        </main>
+      ) : (
       <main className="chat-panel">
         <header className="topbar">
           <span className="topbar-message">message for checking in</span>
-          <button className="mobile-profile" type="button" aria-label="User profile">
-            H
+          {authError && <span className="topbar-error" role="alert">{authError}</span>}
+          <button className="mobile-profile" onClick={signOut} type="button" aria-label="Sign out">
+            {user.display_name.slice(0, 1).toUpperCase()}
           </button>
         </header>
 
@@ -223,14 +423,25 @@ function App() {
             </div>
           ) : (
             <div className="message-list" aria-live="polite">
-              {messages.map((message, index) => (
-                <p
-                  className={`chat-message ${message.role}-message`}
-                  key={`${index}-${message.role}`}
-                >
-                  {message.content}
-                </p>
-              ))}
+              {messages.map((message, index) =>
+                message.pendingConflict ? (
+                  <div className="chat-message assistant-message conflict-message" key={`${index}-conflict`}>
+                    <p>{message.content}</p>
+                    <ConflictActions
+                      disabled={resolvingProposal === message.pendingConflict.proposal_id}
+                      onResolve={(resolution) => resolveChatConflict(message.pendingConflict, resolution)}
+                      proposal={message.pendingConflict}
+                    />
+                  </div>
+                ) : (
+                  <p
+                    className={`chat-message ${message.role}-message`}
+                    key={`${index}-${message.role}`}
+                  >
+                    {message.content}
+                  </p>
+                ),
+              )}
               {isSending && <p className="assistant-message typing-indicator">Thinking...</p>}
             </div>
           )}
@@ -263,26 +474,30 @@ function App() {
               </div>
             </form>
 
-            <div className="composer-settings">
-              <button
-                aria-expanded={settingsOpen}
-                className="settings-trigger"
-                onClick={() => setSettingsOpen((open) => !open)}
-                type="button"
-              >
-                <Icon name="settings" size={17} />
-                <span>Settings</span>
-              </button>
-              {settingsOpen && (
-                <div className="settings-popover">
-                  <span className="popover-label">Response style</span>
-                  <span className="popover-value">Balanced</span>
-                </div>
-              )}
+            <div className="composer-footer">
+              <div className="composer-settings">
+                <button
+                  aria-expanded={settingsOpen}
+                  className="settings-trigger"
+                  onClick={() => setSettingsOpen((open) => !open)}
+                  type="button"
+                >
+                  <Icon name="settings" size={17} />
+                  <span>Settings</span>
+                </button>
+                {settingsOpen && (
+                  <div className="settings-popover">
+                    <span className="popover-label">Response style</span>
+                    <span className="popover-value">Balanced</span>
+                  </div>
+                )}
+              </div>
+              <CurrentDateTime />
             </div>
           </div>
         </section>
       </main>
+      )}
 
       <aside className="sidebar tasks-sidebar" aria-label="Task list">
         <div className="tasks-heading">
@@ -316,6 +531,50 @@ function App() {
           <span>Keep your day moving, one step at a time.</span>
         </div>
       </aside>
+    </div>
+  )
+}
+
+function ConflictActions({ disabled, onResolve, proposal }) {
+  const conflictCount = proposal.conflict_count ?? proposal.conflicts.length
+
+  return (
+    <div className="conflict-actions">
+      <div className="conflict-summary">
+        <strong>Not scheduled yet: {proposal.title}</strong>
+        <span>
+          {proposal.occurrence_count > 1
+            ? `${proposal.occurrence_count} recurring occurrences starting `
+            : ''}{proposal.date} · {formatEventTimeRange(proposal)} overlaps:
+        </span>
+        <ul className="conflict-summary-list">
+          {proposal.conflicts.map((event) => (
+            <li key={event.id}>
+              <strong>{event.title}</strong>
+              <span>{event.date} · {formatEventTimeRange(event)}</span>
+            </li>
+          ))}
+        </ul>
+        <span>
+          {conflictCount > proposal.conflicts.length
+            ? `Showing ${proposal.conflicts.length} of ${conflictCount} conflicts. `
+            : ''}Nothing has changed. Choose how to proceed:
+        </span>
+      </div>
+      <div className="conflict-buttons">
+        <button disabled={disabled} onClick={() => onResolve('override')} type="button">
+          <strong>Replace conflicting event(s)</strong>
+          <span>Remove the listed event(s) and schedule this event.</span>
+        </button>
+        <button disabled={disabled} onClick={() => onResolve('overlap')} type="button">
+          <strong>Schedule both</strong>
+          <span>Keep the existing event(s) and allow the overlap.</span>
+        </button>
+        <button disabled={disabled} onClick={() => onResolve('reject')} type="button">
+          <strong>Cancel scheduling</strong>
+          <span>Leave the calendar unchanged.</span>
+        </button>
+      </div>
     </div>
   )
 }
