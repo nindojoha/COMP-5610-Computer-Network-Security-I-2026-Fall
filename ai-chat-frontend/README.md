@@ -44,4 +44,4 @@ python -m unittest backend.test_main backend.test_storage
 Notes
 11/14/2026: Cannot specify day to schedule events on calendar and needed exact date to schedule events. That has been fixed but model now overrides its events without asking how to resolve conflicts.
 
-11/15/2026: Offset by one day during calendar scheduling. Added login option.
+11/15/2026: Offset by one day during calendar scheduling. Added login option. Takes in documents uploaded and embeds them with gemini's embedding model. Afterwards, store the documents in a hidden file and stores pointers to those files in db. Might be weak to document poisoning or prying code directly.
