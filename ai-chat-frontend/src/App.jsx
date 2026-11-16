@@ -386,6 +386,7 @@ function App() {
             ? 'I found a calendar conflict. Nothing has been changed. Review the event times and choose how to proceed below.'
             : result.reply,
           pendingConflict: result.pending_conflict,
+          quiz: result.quiz,
         },
       ])
     } catch (error) {
@@ -498,6 +499,11 @@ function App() {
                       onResolve={(resolution) => resolveChatConflict(message.pendingConflict, resolution)}
                       proposal={message.pendingConflict}
                     />
+                  </div>
+                ) : message.quiz ? (
+                  <div className="chat-message assistant-message quiz-message" key={`${index}-quiz`}>
+                    <p>{message.content}</p>
+                    <QuizQuestion quiz={message.quiz} />
                   </div>
                 ) : (
                   <p
@@ -661,6 +667,42 @@ function ConflictActions({ disabled, onResolve, proposal }) {
           <span>Leave the calendar unchanged.</span>
         </button>
       </div>
+    </div>
+  )
+}
+
+function QuizQuestion({ quiz }) {
+  const [selectedIndex, setSelectedIndex] = useState(null)
+  const answered = selectedIndex !== null
+
+  return (
+    <div className="quiz-card">
+      <strong className="quiz-question">{quiz.question}</strong>
+      <div className="quiz-options">
+        {quiz.options.map((option, index) => {
+          const isCorrect = index === quiz.correct_index
+          const isSelected = selectedIndex === index
+          return (
+            <button
+              className={`quiz-option${answered && isCorrect ? ' correct' : ''}${isSelected && !isCorrect ? ' incorrect' : ''}`}
+              disabled={answered}
+              key={option}
+              onClick={() => setSelectedIndex(index)}
+              type="button"
+            >
+              <span>{String.fromCharCode(65 + index)}</span>
+              {option}
+            </button>
+          )
+        })}
+      </div>
+      {answered && (
+        <div className={`quiz-feedback ${selectedIndex === quiz.correct_index ? 'correct' : 'incorrect'}`}>
+          <strong>{selectedIndex === quiz.correct_index ? 'Correct!' : 'Not quite.'}</strong>
+          <span>{quiz.explanation}</span>
+          <small>Source: {quiz.source}</small>
+        </div>
+      )}
     </div>
   )
 }

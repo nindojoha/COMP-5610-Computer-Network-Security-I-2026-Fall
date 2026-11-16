@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import hashlib
+import json
 import secrets
 import sqlite3
 from datetime import datetime
@@ -27,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("MODEL_NAME")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-004")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 THINKING_BUDGET = 1024
 MAX_MESSAGE_LENGTH = 10_000
 MAX_HISTORY_MESSAGES = 40
@@ -365,10 +366,17 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
             raise RuntimeError("The embedding service returned an incomplete response.")
         return values
     except Exception as error:
-        logger.exception("Document embedding failed")
+        logger.exception(
+            "Document embedding failed with model %s: %s",
+            EMBEDDING_MODEL,
+            error,
+        )
         raise HTTPException(
             status_code=503,
-            detail="Semantic file search is temporarily unavailable. Please try again.",
+            detail=(
+                "Semantic file search is unavailable. Check that the configured "
+                f"embedding model ({EMBEDDING_MODEL}) is enabled for this Gemini API key."
+            ),
         ) from error
 
 
@@ -394,6 +402,78 @@ def _document_context_for(user_id: str, message: str) -> str:
         "say when the files do not contain the answer.\n"
         f"{excerpts}"
     )
+
+
+def _quiz_context_for(user_id: str, message: str) -> str | None:
+    if not storage.document_exists(user_id):
+        return None
+    matches = storage.search_document_chunks(
+        user_id,
+        _embed_texts([message])[0],
+        top_k=5,
+    )
+    relevant = [match for match in matches if float(match["score"]) >= 0.25]
+    if not relevant:
+        return None
+    return "\n\n".join(
+        f"[{match['name']}]\n{match['content'][:1800]}"
+        for match in relevant
+    )
+
+
+def _quiz_generation_config(context: str) -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        system_instruction=(
+            "You generate exactly one interactive multiple-choice quiz question. "
+            "Use only the supplied uploaded-document excerpts. Do not use web "
+            "search, general knowledge, or facts absent from the excerpts. "
+            "Return valid JSON only with these fields: question (string), "
+            "options (array of exactly four strings), correct_index (integer "
+            "from 0 to 3), explanation (string), and source (string). "
+            "The explanation must be supported by the excerpts. The source must "
+            "name the document used.\n\n"
+            f"Uploaded-document excerpts:\n{context}"
+        ),
+        response_mime_type="application/json",
+        tools=[],
+        thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+    )
+
+
+def _generate_quiz(
+    user_id: str,
+    message: str,
+    contents: list[types.Content],
+) -> dict[str, Any] | None:
+    context = _quiz_context_for(user_id, message)
+    if context is None:
+        return None
+    try:
+        response = get_genai_client().models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=_quiz_generation_config(context),
+        )
+        payload = json.loads((response.text or "").strip())
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("question"), str)
+            or not isinstance(payload.get("options"), list)
+            or len(payload["options"]) != 4
+            or not all(isinstance(option, str) for option in payload["options"])
+            or not isinstance(payload.get("correct_index"), int)
+            or not 0 <= payload["correct_index"] <= 3
+            or not isinstance(payload.get("explanation"), str)
+            or not isinstance(payload.get("source"), str)
+        ):
+            raise ValueError("The quiz response did not match the required format.")
+        return payload
+    except (APIError, ValueError, json.JSONDecodeError) as error:
+        logger.exception("Document-grounded quiz generation failed")
+        raise HTTPException(
+            status_code=502,
+            detail="The document-grounded quiz could not be generated. Please try again.",
+        ) from error
 
 
 def authenticated_user(request: Request) -> dict[str, str]:
@@ -823,6 +903,29 @@ def chat(
     completion_lookup_attempted = False
     calls: list[Any] = []
     system_instruction = _system_instruction_for(request.client_datetime)
+    quiz_request = bool(
+        re.search(
+            r"\b(quiz|quiz me|test me|multiple[\s-]?choice|practice questions?)\b",
+            request.message.casefold(),
+        )
+    )
+    if quiz_request:
+        quiz = _generate_quiz(user["id"], request.message, contents)
+        if quiz is None:
+            return {
+                "reply": (
+                    "I couldn't find sufficiently relevant material in your uploaded "
+                    "files for that quiz. Please upload the relevant notes, lecture, "
+                    "or textbook document and try again."
+                ),
+                "pending_conflict": None,
+                "quiz": None,
+            }
+        return {
+            "reply": "Here is a question based only on your uploaded material:",
+            "pending_conflict": None,
+            "quiz": quiz,
+        }
     system_instruction += _document_context_for(user["id"], request.message)
     try:
         client = get_genai_client()
